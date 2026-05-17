@@ -1,0 +1,131 @@
+
+#include "DFRobot_HumanDetection.h"
+#include <WiFi.h>
+#include "arduino_secrets.h"
+
+// ================== WLAN ==================
+const char* ssid     = SECRET_SSID;
+const char* password = SECRET_PASS;
+
+DFRobot_HumanDetection hu(&Serial1);
+
+// ================== WLAN ==================
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.print("[WIFI] Verbinde...");
+  WiFi.begin(ssid, password);
+  unsigned long start = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("\n[WIFI] Verbunden, IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n[WIFI] NICHT verbunden");
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200);
+      #if defined(ESP32)
+  // Serial (Monitor) läuft über USB-CDC, nicht über UART0
+  Serial1.begin(115200, SERIAL_8N1, /*rx=*/7, /*tx=*/6);
+  // 20/21 = RX/TX beim ESP32-C6 Supermini
+  #else
+  Serial1.begin(115200);
+  #endif
+  
+  connectWiFi();
+
+  // init Radar sensor 
+  Serial.println("Start initialization");
+  while (hu.begin() != 0) {
+    Serial.println("init error!!!");
+    delay(1000);
+  }
+  Serial.println("Initialization successful");
+
+  Serial.println("Start switching work mode");
+  while (hu.configWorkMode(hu.eSleepMode) != 0) {
+    Serial.println("error!!!");
+    delay(1000);
+  }
+  Serial.println("Work mode switch successful");
+
+  Serial.print("Current work mode:");
+  switch (hu.getWorkMode()) {
+    case 1:
+      Serial.println("Fall detection mode");
+      break;
+    case 2:
+      Serial.println("Sleep detection mode");
+      break;
+    default:
+      Serial.println("Read error");
+  }
+
+  hu.configLEDLight(hu.eHPLed, 1);  // Set HP LED switch, it will not light up even if the sensor detects a person when set to 0.
+  hu.sensorRet();                   // Module reset, must perform sensorRet after setting data, otherwise the sensor may not be usable
+
+  Serial.print("HP LED status:");
+  switch (hu.getLEDLightState(hu.eHPLed)) {
+    case 0:
+      Serial.println("Off");
+      break;
+    case 1:
+      Serial.println("On");
+      break;
+    default:
+      Serial.println("Read error");
+  }
+
+  Serial.println();
+  Serial.println();    
+}
+
+void loop() {
+    
+  connectWiFi();
+
+    Serial.print("Existing information:");
+  switch (hu.smHumanData(hu.eHumanPresence)) {
+    case 0:
+      Serial.println("No one is present");
+      break;
+    case 1:
+      Serial.println("Someone is present");
+      break;
+    default:
+      Serial.println("Read error");
+  }
+
+  Serial.print("Motion information:");
+  switch (hu.smHumanData(hu.eHumanMovement)) {
+    case 0:
+      Serial.println("None");
+      break;
+    case 1:
+      Serial.println("Still");
+      break;
+    case 2:
+      Serial.println("Active");
+      break;
+    default:
+      Serial.println("Read error");
+  }
+
+  Serial.print("Body movement parameters: ");
+  Serial.println(hu.smHumanData(hu.eHumanMovingRange));
+  Serial.print("Respiration rate: ");
+  Serial.println(hu.getBreatheValue());
+  Serial.print("Heart rate: ");
+  Serial.println(hu.getHeartRate());
+  Serial.println("-----------------------");
+  delay(1000);
+}
