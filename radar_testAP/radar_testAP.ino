@@ -419,7 +419,7 @@ void loop() {
 
   // Sleep-Composite: In-Bed-Status + Schlafphase
   sSleepComposite comp = hu.getSleepComposite();
-  sensorData.inBed      = comp.inOrNotInBed;
+  sensorData.inBed = comp.presence;
   sensorData.sleepState = comp.sleepState;
 
   sensorData.lastUpdate = millis();
@@ -429,20 +429,20 @@ void loop() {
   // getSleepStatistics() gibt einen leeren Struct wenn noch keine Session vorbei.
   sSleepStatistics stats = hu.getSleepStatistics();
   // Nur speichern wenn sleepScore > 0 (=valide Daten vorhanden)
-  if (stats.sleepQuality > 0) {
-    nightStats.hasData       = true;
-    nightStats.sleepScore    = stats.sleepQuality;
-    nightStats.awakeDuration = stats.awakeDuration;
-    nightStats.lightSleepDur = stats.lightSleepDuration;
-    nightStats.deepSleepDur  = stats.deepSleepDuration;
-    nightStats.avgRespiration= stats.averageRespiration;
-    nightStats.avgHeartRate  = stats.averageHeartRate;
-    nightStats.turnCount     = stats.turnOverNumber;
-    nightStats.apneaEvents   = stats.apneaEvents;
-    nightStats.largeBodyMove = stats.largeBodyMove;
-    nightStats.smallBodyMove = stats.smallBodyMove;
-    nightStats.fetchedAt     = millis();
-    Serial.println("[SLEEP] Neue Nacht-Statistik empfangen!");
+  if (stats.sleepQualityScore > 0) {
+    nightStats.hasData        = true;
+    nightStats.sleepScore     = stats.sleepQualityScore;
+    nightStats.awakeDuration  = stats.wakeDuration;
+    nightStats.lightSleepDur  = stats.shallowSleepPercentage;
+    nightStats.deepSleepDur   = stats.deepSleepPercentage;
+    nightStats.avgRespiration = stats.averageRespiration;
+    nightStats.avgHeartRate   = stats.averageHeartbeat;
+    nightStats.turnCount      = stats.turnOverCount;
+    nightStats.apneaEvents    = stats.apneaEvents;
+    nightStats.largeBodyMove  = comp.largeBodyMove;   // aus comp, nicht stats
+    nightStats.smallBodyMove  = comp.minorBodyMove;   // heißt jetzt minorBodyMove
+    nightStats.fetchedAt      = millis();    
+        Serial.println("[SLEEP] Neue Nacht-Statistik empfangen!");
   }
 
   // --- Serial-Debug ---
