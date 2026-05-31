@@ -39,7 +39,7 @@ struct NightStats {
   bool    hasData;          // wurde schon einmal Statistik empfangen?
   uint32_t awakeDuration;   // Wachzeit in Sekunden
   uint32_t lightSleepDur;   // Leichtschlaf in Sekunden
-  uint32_t deepSleepDur;    // Tiefschlaf in Sekunden
+  uint32_t deepSleepDur;    // Tiefschlaf in Sekunden  !!!ACHTNG FEHLER s. 437
   uint8_t  sleepScore;      // 0–100
   uint8_t  avgRespiration;  // Ø Atemfrequenz
   uint8_t  avgHeartRate;    // Ø Herzrate
@@ -53,10 +53,10 @@ struct NightStats {
 // ================== Hilfsfunktionen ==================
 String sleepStateLabel(uint8_t s) {
   switch (s) {
-    case 0: return "Awake";
+    case 0: return "Deep Sleep";
     case 1: return "Light Sleep";
-    case 2: return "Deep Sleep";
-    case 3: return "REM";
+    case 2: return "Awake";
+    case 3: return "None";
     default: return "Unknown";
   }
 }
@@ -419,7 +419,9 @@ void loop() {
 
   // Sleep-Composite: In-Bed-Status + Schlafphase
   sSleepComposite comp = hu.getSleepComposite();
-  sensorData.inBed = comp.presence;
+  Serial.print("Sleep state raw: "); Serial.println(comp.sleepState);
+  Serial.print("Presence raw:    "); Serial.println(comp.presence);
+  sensorData.inBed = hu.smSleepData(hu.eInOrNotInBed);  // 0=out of bed, 1=in bed
   sensorData.sleepState = comp.sleepState;
 
   sensorData.lastUpdate = millis();
