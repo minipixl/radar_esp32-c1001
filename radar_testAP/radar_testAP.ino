@@ -1,3 +1,5 @@
+// MakerGO ESP32 C6 Supermini
+// wiring: VIN=5V, GND=GND, TX=GPIO7, RX=GPIO6
 #include "DFRobot_HumanDetection.h"
 #include <WiFi.h>
 #include <WebServer.h>
@@ -38,7 +40,7 @@ struct SensorData {
 struct NightStats {
   bool    hasData;          // wurde schon einmal Statistik empfangen?
   uint32_t awakeDuration;   // Wachzeit in Sekunden
-  uint32_t lightSleepDur;   // Leichtschlaf in Sekunden
+  uint32_t lightSleepDur;   // Leichtschlaf in Sekunden§
   uint32_t deepSleepDur;    // Tiefschlaf in Sekunden  !!!ACHTNG FEHLER s. 437
   uint8_t  sleepScore;      // 0–100
   uint8_t  avgRespiration;  // Ø Atemfrequenz
@@ -392,7 +394,7 @@ void setup() {
     default: Serial.println("Read error");
   }
 
-  hu.configLEDLight(hu.eHPLed, 1);
+  hu.configLEDLight(hu.eHPLed, 0); // keep red LED dark for better sleep...
   hu.sensorRet();
 
   Serial.print("HP LED status: ");
