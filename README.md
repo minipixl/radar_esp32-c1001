@@ -11,13 +11,16 @@ heartRate\
 Two startup modi:\
 GP8 on VCC:  start as access point\
 GP8 on GND or open: start normal WIFI mode\
-<img width="860" height="856" alt="radar_c1001_web" src="https://github.com/user-attachments/assets/d8729165-3817-4333-a97d-48e1359348e7" />
+<img width="588" height="775" alt="Bildschirmfoto vom 2026-07-26 14-50-24" src="https://github.com/user-attachments/assets/d76c137d-18df-4482-8eca-d597674f7324" />
 
-Wiring scheme C1001 with esp32-c6 supermini:
-VIN - 5V
-GND - GND
-TX - GP7
-RX - GP6
+Wiring scheme C1001 with esp32-c6 supermini:\
+VIN - 5V \
+GND - GND \
+TX - GP7 \
+RX - GP6 \
+<img width="794" height="1123" alt="wiring" src="https://github.com/user-attachments/assets/5acaae30-a4ae-49d3-b7ff-bbf1bdb35525" />
+
+
 
 
 
