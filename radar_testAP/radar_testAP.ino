@@ -1,5 +1,3 @@
-// MakerGO ESP32 C6 Supermini
-// wiring: VIN=5V, GND=GND, TX=GPIO7, RX=GPIO6
 #include "DFRobot_HumanDetection.h"
 #include <WiFi.h>
 #include <WebServer.h>
@@ -18,6 +16,25 @@ bool apMode = false;
 
 DFRobot_HumanDetection hu(&Serial1);
 WebServer server(80);
+
+// ---- Remote-Debug-Log (Ringpuffer, per /log im Browser abrufbar) ----
+#define LOG_BUF_SIZE 8000
+char logBuf[LOG_BUF_SIZE + 1];
+size_t logBufLen = 0;
+
+void logMsg(const String &msg) {
+  Serial.println(msg);
+  String line = "[" + String(millis() / 1000) + "s] " + msg + "\n";
+  if (logBufLen + line.length() >= LOG_BUF_SIZE) {
+    // Puffer voll -> älteste Hälfte verwerfen, Platz schaffen
+    size_t keep = logBufLen / 2;
+    memmove(logBuf, logBuf + (logBufLen - keep), keep);
+    logBufLen = keep;
+  }
+  memcpy(logBuf + logBufLen, line.c_str(), line.length());
+  logBufLen += line.length();
+  logBuf[logBufLen] = '\0';
+}
 
 // ================== Sensor-Daten (Live) ==================
 struct SensorData {
@@ -40,7 +57,7 @@ struct SensorData {
 struct NightStats {
   bool    hasData;          // wurde schon einmal Statistik empfangen?
   uint32_t awakeDuration;   // Wachzeit in Sekunden
-  uint32_t lightSleepDur;   // Leichtschlaf in Sekunden§
+  uint32_t lightSleepDur;   // Leichtschlaf in Sekunden
   uint32_t deepSleepDur;    // Tiefschlaf in Sekunden  !!!ACHTNG FEHLER s. 437
   uint8_t  sleepScore;      // 0–100
   uint8_t  avgRespiration;  // Ø Atemfrequenz
@@ -370,6 +387,9 @@ void setup() {
   server.on("/",      handleRoot);
   server.on("/sleep", handleSleep);
   server.on("/json",  handleJSON);
+  server.on("/log",   HTTP_GET, [](){
+    server.send(200, "text/plain", String(logBuf));
+  });
   server.begin();
   Serial.println("[WEB]  Server gestartet (/, /sleep, /json)");
 
@@ -394,7 +414,7 @@ void setup() {
     default: Serial.println("Read error");
   }
 
-  hu.configLEDLight(hu.eHPLed, 0); // keep red LED dark for better sleep...
+  hu.configLEDLight(hu.eHPLed, 0);  // rote Presence-LED aus (0 = dunkel, auch bei erkannter Person)
   hu.sensorRet();
 
   Serial.print("HP LED status: ");
@@ -421,10 +441,21 @@ void loop() {
 
   // Sleep-Composite: In-Bed-Status + Schlafphase
   sSleepComposite comp = hu.getSleepComposite();
-  Serial.print("Sleep state raw: "); Serial.println(comp.sleepState);
-  Serial.print("Presence raw:    "); Serial.println(comp.presence);
   sensorData.inBed = hu.smSleepData(hu.eInOrNotInBed);  // 0=out of bed, 1=in bed
   sensorData.sleepState = comp.sleepState;
+
+  // Nur bei Änderung loggen, sonst läuft der Puffer in Minuten voll
+  static int lastSleepState = -99;
+  static int lastInBed = -99;
+  static int lastPresence = -99;
+  if (comp.sleepState != lastSleepState || sensorData.inBed != lastInBed || comp.presence != lastPresence) {
+    logMsg("[STATE] sleepState " + String(lastSleepState) + "->" + String(comp.sleepState)
+         + " | inBed " + String(lastInBed) + "->" + String(sensorData.inBed)
+         + " | presence " + String(lastPresence) + "->" + String(comp.presence));
+    lastSleepState = comp.sleepState;
+    lastInBed = sensorData.inBed;
+    lastPresence = comp.presence;
+  }
 
   sensorData.lastUpdate = millis();
 
@@ -445,8 +476,15 @@ void loop() {
     nightStats.apneaEvents    = stats.apneaEvents;
     nightStats.largeBodyMove  = comp.largeBodyMove;   // aus comp, nicht stats
     nightStats.smallBodyMove  = comp.minorBodyMove;   // heißt jetzt minorBodyMove
-    nightStats.fetchedAt      = millis();    
-        Serial.println("[SLEEP] Neue Nacht-Statistik empfangen!");
+    nightStats.fetchedAt      = millis();
+    logMsg("[SLEEP] Neue Nacht-Statistik empfangen! Score=" + String(stats.sleepQualityScore)
+         + " wakeDur=" + String(stats.wakeDuration)
+         + " shallow%=" + String(stats.shallowSleepPercentage)
+         + " deep%=" + String(stats.deepSleepPercentage)
+         + " turns=" + String(stats.turnOverCount)
+         + " apnea=" + String(stats.apneaEvents));
+  } else if (stats.sleepQualityScore == 0 && lastInBed == 0 && sensorData.inBed == 1) {
+    logMsg("[SLEEP] Neue Session gestartet (gerade ins Bett gegangen), score noch 0");
   }
 
   // --- Serial-Debug ---
