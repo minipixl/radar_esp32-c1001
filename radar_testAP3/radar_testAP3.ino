@@ -1,7 +1,7 @@
 #include "DFRobot_HumanDetection.h"
 #include <WiFi.h>
 #include <WebServer.h>
-#include "arduino_secrets.h"
+#include "arduino_secrets.h" // contains login credentials
 
 // ================== KONFIGURATION ==================
 const char* ssid     = SECRET_SSID;
@@ -58,7 +58,7 @@ struct NightStats {
   bool    hasData;          // wurde schon einmal Statistik empfangen?
   uint32_t awakeDuration;   // Wachzeit in Sekunden
   uint32_t lightSleepDur;   // Leichtschlaf in Sekunden
-  uint32_t deepSleepDur;    // Tiefschlaf in Sekunden  !!!ACHTNG FEHLER s. 437
+  uint32_t deepSleepDur;    // Tiefschlaf in Sekunden  !!!ACHTNG FEHLER s. Zeile 437
   uint8_t  sleepScore;      // 0–100
   uint8_t  avgRespiration;  // Ø Atemfrequenz
   uint8_t  avgHeartRate;    // Ø Herzrate
