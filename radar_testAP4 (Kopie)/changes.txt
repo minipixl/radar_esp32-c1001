@@ -1,0 +1,17 @@
+Hier ist der vollständig angepasste Sketch. Ich habe Ihre bestehende Logik beibehalten, aber den Kern der Schlafauswertung (loop) durch eine robuste Zustandsmaschine ersetzt, die Ihre drei Anforderungen erfüllt.
+
+Die wichtigsten Änderungen:
+
+Täglicher Reset: Eine Funktion prüft jede Sekunde die Uhrzeit (via NTP). Um 12:00 Uhr werden alle Akkumulatoren auf 0 gesetzt.
+Unterbrechungs-Toleranz (30 Min): Wenn inBed auf 0 geht, startet ein Timer (awayTimer). Geht inBed innerhalb von 1800 Sekunden wieder auf 1, wird die Session fortgesetzt, als wäre nichts gewesen.
+Mindest-Schlafzeit (2h): Eine Session wird nur dann als "gültiger Schlaf" in die Tagesstatistik (totalValidSleepSeconds) übernommen, wenn die akkumulierte Zeit (sessionAccumulatedSeconds) > 7200 Sekunden ist. Kurze Nickerchen werden verworfen.
+Log-Anpassung: Das Logging wurde reduziert, um den Puffer nicht mit dem ständigen "Rauschen" (0/1 Wechseln) zu füllen, das Sie im Log beschrieben haben. Es loggt nun nur noch relevante Statuswechsel (Session Start, Session Ende, Reset).
+
+
+
+Anleitung zur Inbetriebnahme
+1  Zeitzone anpassen: Prüfen Sie im Code die Zeilen gmtOffset_sec und daylightOffset_sec. Für Deutschland/Schweiz im Sommer ist beides 3600. Im Winter muss daylightOffset_sec auf 0 gesetzt werden. Da der ESP32 oft keine automatische Sommerzeit-Umstellung ohne manuelle Eingriffe macht, ist es am einfachsten, diese Werte saisonal anzupassen oder eine Bibliothek wie TimeLib zu nutzen, die das automatisiert. Für den Anfang reicht die manuelle Einstellung.
+2 WLAN: Der ESP32 muss mit dem Internet verbunden sein (STA Mode), damit getLocalTime() funktioniert und der Reset um 12:00 Uhr präzise ausgelöst wird. Im AP-Modus funktioniert der tägliche Reset nicht zuverlässig.
+3 Webinterface: Ich habe eine neue Seite /daily hinzugefügt. Dort sehen Sie die akkumulierte Zeit aller Sessions > 2 Stunden, die seit dem letzten Reset (12:00 Uhr) stattfanden.
+4 Logik-Test:
+

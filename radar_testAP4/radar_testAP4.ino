@@ -1,21 +1,17 @@
 /*********************************************************************
  * Radar-Schlafüberwachung mit ESP32-C6 SuperMini + DFRobot C1001 + MQTT
- * Umsetzung der Funktionalen Spezifikation funct_spec.md
+ * Umsetzung der Funktionalen Spezifikation funct_spec2.md
  *
  * Benötigte Libraries (über Bibliotheksverwalter bzw. GitHub):
  *   - DFRobot_HumanDetection   (DFRobot, github.com/DFRobot/DFRobot_HumanDetection)
  *   - PubSubClient             (Nick O'Leary, Bibliotheksverwalter)
  *   - WiFi                     (im ESP32-Board-Package enthalten)
  *   - WebServer                (im ESP32-Board-Package enthalten)
+ *   - time.h                   (Teil des ESP32-Cores, keine Installation nötig)
  *
- * WICHTIG: Die Feldnamen von sSleepComposite / smSleepData()-Enums
- * unterscheiden sich zwischen Versionen der DFRobot-Library (siehe
- * eigene Erfahrung aus früheren Projekten). Die hier verwendeten Namen
- * (shallowSleepPercentage, deepSleepPercentage, wakeDuration,
- * averageHeartbeat, turnOverCount, eWakeDuration, eDeepSleepDuration)
- * entsprechen dem zuletzt bei dir funktionierenden Stand. Bitte gegen
- * die tatsächlich installierte DFRobot_HumanDetection.h/.cpp prüfen,
- * falls der Compiler "no member named ..." meldet.
+ * Alle sSleepStatistics/sSleepComposite-Feldnamen und smSleepData()-Enums
+ * wurden am 2026-08 gegen die reale DFRobot_HumanDetection.h/.cpp von
+ * github.com/DFRobot/DFRobot_HumanDetection (Branch "master") geprüft.
  *********************************************************************/
 
 #include "DFRobot_HumanDetection.h"
@@ -24,6 +20,7 @@
 #include <PubSubClient.h>
 #include <Arduino.h>
 #include <WebServer.h>
+#include <time.h>              // NTP / Echtzeit (Abschnitt 2)
 #include "arduino_secrets.h"  // SECRET_SSID, SECRET_PASS, SECRET_AP_SSID, SECRET_AP_PASSWORD
 
 // ==================== KONFIGURATION ====================
@@ -50,6 +47,12 @@ const uint32_t INTERRUPTION_WINDOW_MS   = 5UL * 60UL * 1000UL;  // 5 Min. Tolera
 const uint32_t MIN_DURATION_FOR_SESSION = 20UL * 60UL * 1000UL; // Mindestlänge, damit eine Session zählt (20 Min.)
 const uint32_t SENSOR_READ_INTERVAL_MS  = 1000UL;               // 1x pro Sekunde messen/publishen
 
+// --- Echtzeit / NTP (Abschnitt 2) ---
+const char* NTP_SERVER_1 = "de.pool.ntp.org";
+const char* NTP_SERVER_2 = "pool.ntp.org";
+// POSIX-TZ-String für Deutschland/Schweiz (MEZ/MESZ inkl. automatischer Sommerzeit-Umstellung)
+const char* TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3";
+
 // --- Ringpuffer für /log ---
 const uint8_t LOG_BUFFER_SIZE = 40;
 
@@ -70,7 +73,12 @@ const char* RADAR_CSS =
   ".dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle}"
   ".badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:.85rem;vertical-align:middle}"
   ".bar{height:10px;border-radius:6px;background:#1c2431;overflow:hidden;display:flex;margin-top:6px}"
-  ".seg-deep{background:#2ecc71}.seg-light{background:#3498db}.seg-awake{background:#e74c3c}";
+  ".seg-deep{background:#2ecc71}.seg-light{background:#3498db}.seg-awake{background:#e74c3c}"
+  ".btnrow{display:flex;gap:10px;padding:0 20px 16px}"
+  ".btn{flex:1;text-align:center;padding:12px;border-radius:8px;text-decoration:none;font-weight:600;font-size:.9rem}"
+  ".btn-start{background:#2ecc7122;color:#2ecc71;border:1px solid #2ecc7166}"
+  ".btn-stop{background:#e74c3c22;color:#e74c3c;border:1px solid #e74c3c66}"
+  ".manual-badge{display:inline-block;margin-left:8px;padding:2px 8px;border-radius:20px;font-size:.7rem;background:#f39c1222;color:#f39c12;border:1px solid #f39c1244}";
 
 // ==================== DATENSTRUKTUREN ====================
 
@@ -89,6 +97,8 @@ struct SensorData {
 struct NightStats {
   unsigned long sessionStartMs   = 0;
   unsigned long sessionEndMs     = 0;
+  String   sessionStartTimeStr   = "--:--:--"; // Abschnitt 5: Uhrzeit statt Sekunden
+  String   sessionEndTimeStr     = "--:--:--";
   uint32_t sessionDurationSec    = 0;
   uint32_t wakeDurationSec       = 0;
   uint32_t deepSleepDurationSec  = 0;
@@ -102,6 +112,7 @@ struct NightStats {
   uint16_t apneaEvents           = 0;
   uint16_t largeBodyMove         = 0;
   uint16_t smallBodyMove         = 0;
+  bool     manualSession         = false; // true, falls per Knopf gestartet/beendet
   bool     valid                 = false; // true sobald mind. eine Session abgeschlossen wurde
 };
 
@@ -123,6 +134,13 @@ NightStats nightStats;         // letzte abgeschlossene Session
 SessionState sessionState = OUT_OF_BED;
 unsigned long sessionStartMs = 0;
 unsigned long graceStartMs   = 0;
+String currentSessionStartTimeStr = "--:--:--";
+
+// Manuelle Übersteuerung (Abschnitt 4): true, solange die automatische
+// inBed-gesteuerte State-Machine pausiert ist und Start/Stop nur noch über
+// die Webserver-Buttons /start bzw. /stop erfolgen.
+bool manualControlActive = false;
+bool timeSynced = false;
 
 String logBuffer[LOG_BUFFER_SIZE];
 uint8_t logIndex = 0;
@@ -147,8 +165,30 @@ const char* sleepStateLabel(int state) {
   }
 }
 
+// Aktuelle Uhrzeit als HH:MM:SS (24h), Abschnitt 2. Liefert "--:--:--",
+// solange noch kein NTP-Sync stattgefunden hat (z.B. im AP-Fallback ohne
+// Internetzugang).
+String nowTimeStr() {
+  if (!timeSynced) return "--:--:--";
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 50)) return "--:--:--";
+  char buf[9];
+  strftime(buf, sizeof(buf), "%H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
+// Sekunden -> HH:MM:SS Dauer-Format (Abschnitt 2/5: "hh:mm:ss statt Sekunden").
+String secToHms(uint32_t totalSeconds) {
+  uint32_t h = totalSeconds / 3600UL;
+  uint32_t m = (totalSeconds % 3600UL) / 60UL;
+  uint32_t s = totalSeconds % 60UL;
+  char buf[10];
+  snprintf(buf, sizeof(buf), "%02u:%02u:%02u", (unsigned)h, (unsigned)m, (unsigned)s);
+  return String(buf);
+}
+
 void logMsg(const String& msg) {
-  String line = "[" + String(millis() / 1000) + "s] " + msg;
+  String line = "[" + nowTimeStr() + "] " + msg;
   Serial.println(line);
   logBuffer[logIndex] = line;
   logIndex = (logIndex + 1) % LOG_BUFFER_SIZE;
@@ -176,6 +216,20 @@ void startNetwork() {
     Serial.println();
     Serial.print("[WIFI] Verbunden, IP: ");
     Serial.println(WiFi.localIP());
+
+    // NTP-Zeitsync (Abschnitt 2) - nur möglich mit Internetzugang, also nicht im AP-Fallback.
+    Serial.println("[NTP]  Synchronisiere Uhrzeit...");
+    configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2);
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 10000)) { // bis zu 10s auf Sync warten
+      timeSynced = true;
+      char buf[9];
+      strftime(buf, sizeof(buf), "%H:%M:%S", &timeinfo);
+      Serial.print("[NTP]  Uhrzeit synchronisiert: ");
+      Serial.println(buf);
+    } else {
+      Serial.println("[NTP]  Sync fehlgeschlagen, versuche es spaeter erneut");
+    }
   } else {
     Serial.println();
     Serial.println("[WIFI] Kein WLAN gefunden -> starte Access Point Fallback");
@@ -217,6 +271,11 @@ void reconnectWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     apMode = false;
     Serial.println(" OK, zurück im Heim-WLAN");
+    if (!timeSynced) {
+      configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2);
+      struct tm timeinfo;
+      if (getLocalTime(&timeinfo, 5000)) timeSynced = true;
+    }
   } else if (!apMode) {
     // War vorher im STA-Modus und hat es nicht geschafft -> auf AP umschalten
     Serial.println(" Fehler, wechsle in AP-Modus");
@@ -267,6 +326,9 @@ void publishNightStats() {
   if (!mqttClient.connected() || !nightStats.valid) return;
 
   String payload = "{";
+  payload += "\"sessionStartTime\":\""   + nightStats.sessionStartTimeStr    + "\",";
+  payload += "\"sessionEndTime\":\""     + nightStats.sessionEndTimeStr      + "\",";
+  payload += "\"manualSession\":"        + String(nightStats.manualSession ? "true" : "false") + ",";
   payload += "\"sessionDurationSec\":"    + String(nightStats.sessionDurationSec)    + ",";
   payload += "\"wakeDurationSec\":"       + String(nightStats.wakeDurationSec)       + ",";
   payload += "\"deepSleepDurationSec\":"  + String(nightStats.deepSleepDurationSec)  + ",";
@@ -288,7 +350,7 @@ void publishNightStats() {
 
 // ==================== SESSION STATE MACHINE (Abschnitt 4) ====================
 //
-// Zustandsübergänge:
+// Zustandsübergänge (automatischer Modus):
 //   OUT_OF_BED  --inBed==1-->  IN_BED           (neue Session startet)
 //   IN_BED      --inBed==0-->  GRACE_EXIT        (Session pausiert, Toleranzfenster startet)
 //   GRACE_EXIT  --inBed==1-->  IN_BED            (Session läuft weiter, kein Abbruch)
@@ -296,8 +358,17 @@ void publishNightStats() {
 //
 // Dadurch werden kurze Aufstehphasen (<5 Min, z.B. Toilette) nicht mehr als
 // Sessionende fehlinterpretiert.
+//
+// MANUELLE ÜBERSTEUERUNG: Solange manualControlActive true ist (per /start
+// bzw. /stop im Live-Dashboard gesetzt), wird diese automatische Logik
+// komplett übersprungen. Start und Ende der Session werden dann
+// ausschließlich durch die Buttons bestimmt - der Sensor liefert in dieser
+// Zeit weiterhin Live-Werte (Herzfrequenz, Atmung etc.), aber inBed-Wechsel
+// lösen keine Zustandsübergänge mehr aus.
 
 void runSessionStateMachine() {
+  if (manualControlActive) return; // Automatik pausiert während manueller Steuerung
+
   bool inBedNow = (sensorData.inBed == 1);
 
   switch (sessionState) {
@@ -305,6 +376,7 @@ void runSessionStateMachine() {
     case OUT_OF_BED:
       if (inBedNow) {
         sessionStartMs = millis();
+        currentSessionStartTimeStr = nowTimeStr();
         sessionState = IN_BED;
         logMsg("[SESSION] Bett betreten - neue Session gestartet");
       }
@@ -335,8 +407,11 @@ void finalizeSession() {
   uint32_t sessionDurationMs = millis() - sessionStartMs;
   uint32_t sessionDurationSec = sessionDurationMs / 1000;
 
-  if (sessionDurationSec < (MIN_DURATION_FOR_SESSION / 1000)) {
-    logMsg("[SESSION] Zu kurz (" + String(sessionDurationSec) + "s), wird verworfen");
+  // Bei manuell gestoppten Sessions greift die Mindestdauer nicht - wenn der
+  // Nutzer bewusst "Stop" drückt, soll das respektiert werden, auch wenn die
+  // Session kürzer als MIN_DURATION_FOR_SESSION war.
+  if (!manualControlActive && sessionDurationSec < (MIN_DURATION_FOR_SESSION / 1000)) {
+    logMsg("[SESSION] Zu kurz (" + secToHms(sessionDurationSec) + "), wird verworfen");
     return;
   }
 
@@ -344,6 +419,14 @@ void finalizeSession() {
   // sSleepStatistics.sleepTime (kumulativer Zähler) nutzen. Der Sensor
   // liefert diese beiden Werte in MINUTEN (siehe DFRobot_HumanDetection.cpp,
   // case eWakeDuration / eDeepSleepDuration).
+  //
+  // WICHTIG (manuelle Übersteuerung): Diese Werte berechnet der Sensor
+  // intern anhand SEINES EIGENEN Erkennungszeitraums - sie lassen sich durch
+  // die Start/Stop-Buttons NICHT zurücksetzen oder exakt an unsere manuell
+  // definierten Grenzen anpassen. Bei manuellem Start/Stop können Wake-/
+  // Deep-Sleep-Aufteilung und Score also von der tatsächlich manuell
+  // gewählten Zeitspanne abweichen - nur sessionStart/-EndZeit und die
+  // Gesamtdauer sind bei manueller Steuerung exakt.
   uint32_t wakeDurationMin      = hu.smSleepData(hu.eWakeDuration);
   uint32_t deepSleepDurationMin = hu.smSleepData(hu.eDeepSleepDuration);
 
@@ -356,6 +439,8 @@ void finalizeSession() {
 
   nightStats.sessionStartMs      = sessionStartMs;
   nightStats.sessionEndMs        = millis();
+  nightStats.sessionStartTimeStr = currentSessionStartTimeStr;
+  nightStats.sessionEndTimeStr   = nowTimeStr();
   nightStats.sessionDurationSec  = sessionDurationSec;
   nightStats.wakeDurationSec     = wakeDurationMin * 60UL;
   nightStats.deepSleepDurationSec= deepSleepDurationMin * 60UL;
@@ -371,10 +456,49 @@ void finalizeSession() {
   nightStats.apneaEvents         = stats.apneaEvents;
   nightStats.largeBodyMove       = comp.largeBodyMove;
   nightStats.smallBodyMove       = comp.minorBodyMove;
+  nightStats.manualSession       = manualControlActive;
   nightStats.valid               = true;
 
-  logMsg("[SESSION] Abgeschlossen: " + String(sessionDurationSec / 60) + " Min, Score " + String(nightStats.sleepScore));
+  logMsg("[SESSION] Abgeschlossen (" + nightStats.sessionStartTimeStr + " - " + nightStats.sessionEndTimeStr +
+         ", " + secToHms(sessionDurationSec) + "), Score " + String(nightStats.sleepScore));
   publishNightStats();
+}
+
+// ==================== MANUELLE ÜBERSTEUERUNG (Abschnitt 4) ====================
+//
+// /start: Beginnt eine Session manuell (falls keine läuft) bzw. übernimmt
+//         eine bereits automatisch laufende Session in die manuelle
+//         Steuerung, ohne deren Startzeit zu verwerfen.
+// /stop:  Beendet die aktuell laufende Session sofort (unabhängig davon, ob
+//         sie automatisch oder manuell gestartet wurde) und wertet sie aus.
+//         Danach kehrt das Gerät wieder in den automatischen Modus zurück.
+
+void handleStartSession() {
+  if (sessionState == OUT_OF_BED) {
+    sessionStartMs = millis();
+    currentSessionStartTimeStr = nowTimeStr();
+    sessionState = IN_BED;
+    logMsg("[SESSION] Manueller Start (" + currentSessionStartTimeStr + ")");
+  } else {
+    logMsg("[SESSION] Manuelle Übersteuerung uebernimmt laufende Session");
+  }
+  manualControlActive = true;
+
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleStopSession() {
+  if (sessionState != OUT_OF_BED) {
+    finalizeSession();
+  } else {
+    logMsg("[SESSION] Manueller Stop ohne laufende Session ignoriert");
+  }
+  sessionState = OUT_OF_BED;
+  manualControlActive = false;
+
+  server.sendHeader("Location", "/");
+  server.send(303);
 }
 
 // ==================== SENSOR-INITIALISIERUNG (nicht-blockierend) ====================
@@ -447,8 +571,10 @@ void setup() {
   server.on("/sleep",  handleSleep);
   server.on("/json",   handleJSON);
   server.on("/log",    handleLog);
+  server.on("/start",  handleStartSession);
+  server.on("/stop",   handleStopSession);
   server.begin();
-  Serial.println("[WEB]  Server gestartet (/, /sleep, /json, /log)");
+  Serial.println("[WEB]  Server gestartet (/, /sleep, /json, /log, /start, /stop)");
 
   logMsg("[BOOT] Setup abgeschlossen");
 }
@@ -534,6 +660,11 @@ void handleRoot() {
   html += "</svg><h1>Radar Sensor<span>ESP32-C6 / DFRobot C1001</span></h1></header>";
   html += "<div class='nav'><a href='/' class='active'>Live</a><a href='/sleep'>Statistik</a><a href='/json'>JSON</a><a href='/log'>Log</a></div>";
 
+  html += "<div class='btnrow'>";
+  html += "<a href='/start' class='btn btn-start'>&#9654; Start Session</a>";
+  html += "<a href='/stop' class='btn btn-stop'>&#9632; Stop Session</a>";
+  html += "</div>";
+
   if (!sensorReady) {
     html += "<div class='grid'><div class='card' style='grid-column:1/-1;border-color:#e74c3c'>";
     html += "<div class='label'>Sensor</div><div style='font-size:1.1rem;color:#e74c3c'>Nicht verbunden - Initialisierung wird im Hintergrund wiederholt (siehe /log)</div>";
@@ -569,7 +700,17 @@ void handleRoot() {
 
   html += "<div class='card'><div class='label'>Session-Status</div>";
   String sstLabel = (sessionState == OUT_OF_BED) ? "Kein Schlaf aktiv" : (sessionState == IN_BED ? "Session laeuft" : "Kurz aufgestanden (Grace)");
-  html += "<div style='font-size:1.1rem'>" + sstLabel + "</div></div>";
+  html += "<div style='font-size:1.1rem'>" + sstLabel;
+  if (manualControlActive) html += "<span class='manual-badge'>MANUELL</span>";
+  html += "</div></div>";
+
+  if (sessionState != OUT_OF_BED) {
+    html += "<div class='card'><div class='label'>Session gestartet</div>";
+    html += "<div style='font-size:1.2rem'>" + currentSessionStartTimeStr + " Uhr</div></div>";
+  }
+
+  html += "<div class='card'><div class='label'>Aktuelle Uhrzeit</div>";
+  html += "<div style='font-size:1.2rem'>" + nowTimeStr() + " Uhr</div></div>";
 
   html += "<div class='card'><div class='label'>Letztes Update</div>";
   html += "<div>" + String(age) + " s her</div></div>";
@@ -589,10 +730,15 @@ void handleSleep() {
     html += "<div class='grid'><div class='card'>Noch keine abgeschlossene Session vorhanden.</div></div>";
   } else {
     html += "<div class='grid'>";
-    html += "<div class='card'><div class='label'>Gesamtdauer</div><div style='font-size:1.4rem'>" + String(nightStats.sessionDurationSec / 60) + " Min</div></div>";
-    html += "<div class='card'><div class='label'>Tiefschlaf</div><div style='font-size:1.4rem'>" + String(nightStats.deepSleepDurationSec / 60) + " Min (" + String(nightStats.deepSleepPercentage) + "%)</div></div>";
-    html += "<div class='card'><div class='label'>Leichtschlaf</div><div style='font-size:1.4rem'>" + String(nightStats.lightSleepDurationSec / 60) + " Min (" + String(nightStats.lightSleepPercentage) + "%)</div></div>";
-    html += "<div class='card'><div class='label'>Wachphasen</div><div style='font-size:1.4rem'>" + String(nightStats.wakeDurationSec / 60) + " Min</div></div>";
+    html += "<div class='card'><div class='label'>Beginn</div><div style='font-size:1.4rem'>" + nightStats.sessionStartTimeStr + " Uhr</div></div>";
+    html += "<div class='card'><div class='label'>Ende</div><div style='font-size:1.4rem'>" + nightStats.sessionEndTimeStr + " Uhr</div></div>";
+    if (nightStats.manualSession) {
+      html += "<div class='card'><div class='label'>Erfassung</div><div style='font-size:1.1rem'><span class='manual-badge'>MANUELL</span></div></div>";
+    }
+    html += "<div class='card'><div class='label'>Gesamtdauer</div><div style='font-size:1.4rem'>" + secToHms(nightStats.sessionDurationSec) + "</div></div>";
+    html += "<div class='card'><div class='label'>Tiefschlaf</div><div style='font-size:1.4rem'>" + secToHms(nightStats.deepSleepDurationSec) + " (" + String(nightStats.deepSleepPercentage) + "%)</div></div>";
+    html += "<div class='card'><div class='label'>Leichtschlaf</div><div style='font-size:1.4rem'>" + secToHms(nightStats.lightSleepDurationSec) + " (" + String(nightStats.lightSleepPercentage) + "%)</div></div>";
+    html += "<div class='card'><div class='label'>Wachphasen</div><div style='font-size:1.4rem'>" + secToHms(nightStats.wakeDurationSec) + "</div></div>";
     html += "<div class='card'><div class='label'>Schlaf-Score</div><div style='font-size:1.4rem'>" + String(nightStats.sleepScore) + " / 100</div></div>";
     html += "<div class='card'><div class='label'>Ø Herzfrequenz</div><div style='font-size:1.4rem'>" + String(nightStats.avgHeartRate) + " bpm</div></div>";
     html += "<div class='card'><div class='label'>Ø Atemfrequenz</div><div style='font-size:1.4rem'>" + String(nightStats.avgRespiration) + " /min</div></div>";
@@ -616,6 +762,9 @@ void handleSleep() {
 void handleJSON() {
   String json = "{";
   json += "\"sensorReady\":" + String(sensorReady ? "true" : "false") + ",";
+  json += "\"currentTime\":\"" + nowTimeStr() + "\",";
+  json += "\"timeSynced\":" + String(timeSynced ? "true" : "false") + ",";
+  json += "\"manualControlActive\":" + String(manualControlActive ? "true" : "false") + ",";
   json += "\"presence\":"     + String(sensorData.presence)        + ",";
   json += "\"movement\":"     + String(sensorData.movement)        + ",";
   json += "\"movementParam\":"+ String(sensorData.movementParam)   + ",";
