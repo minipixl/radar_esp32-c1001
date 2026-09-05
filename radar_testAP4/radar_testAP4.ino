@@ -21,6 +21,7 @@
 #include <Arduino.h>
 #include <WebServer.h>
 #include <time.h>              // NTP / Echtzeit (Abschnitt 2)
+#include "esp_system.h"        // esp_reset_reason() - Diagnose fuer naechtliche Reboots
 #include "arduino_secrets.h"  // SECRET_SSID, SECRET_PASS, SECRET_AP_SSID, SECRET_AP_PASSWORD
 
 // ==================== KONFIGURATION ====================
@@ -43,7 +44,7 @@ const char* MQTT_STATS_TOPIC = "home/radar/sleep/stats";   // pro abgeschlossene
 const char* MQTT_LOG_TOPIC   = "home/radar/log";
 
 // --- Session-Logik (Abschnitt 4) ---
-const uint32_t INTERRUPTION_WINDOW_MS   = 5UL * 60UL * 1000UL;  // 5 Min. Toleranz für kurzes Aufstehen
+const uint32_t INTERRUPTION_WINDOW_MS   = 10UL * 60UL * 1000UL;  // 10 Min. Toleranz für kurzes Aufstehen
 const uint32_t MIN_DURATION_FOR_SESSION = 20UL * 60UL * 1000UL; // Mindestlänge, damit eine Session zählt (20 Min.)
 const uint32_t SENSOR_READ_INTERVAL_MS  = 1000UL;               // 1x pro Sekunde messen/publishen
 
@@ -54,7 +55,7 @@ const char* NTP_SERVER_2 = "pool.ntp.org";
 const char* TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3";
 
 // --- Ringpuffer für /log ---
-const uint8_t LOG_BUFFER_SIZE = 40;
+const uint8_t LOG_BUFFER_SIZE = 500;
 
 // --- Web-Stylesheet ---
 // Hinweis: "SS" ist auf dem ESP32-C6 SuperMini bereits als SPI-Pin (uint8_t)
@@ -153,6 +154,10 @@ unsigned long lastSensorRead = 0;
 unsigned long lastSensorInitAttempt = 0;
 const uint32_t SENSOR_INIT_RETRY_MS = 5000; // alle 5s erneut versuchen, falls Sensor nicht antwortet
 
+// --- Diagnose fuer naechtliche Reboots ---
+unsigned long lastHeapLog = 0;
+const uint32_t HEAP_LOG_INTERVAL_MS = 5UL * 60UL * 1000UL; // alle 5 Min. Heap-Status loggen
+
 // ==================== HILFSFUNKTIONEN ====================
 
 const char* sleepStateLabel(int state) {
@@ -196,6 +201,34 @@ void logMsg(const String& msg) {
   if (mqttClient.connected()) {
     mqttClient.publish(MQTT_LOG_TOPIC, line.c_str());
   }
+}
+
+// Loggt den Grund des letzten Resets/Neustarts. Wird ganz am Anfang von
+// setup() aufgerufen, damit der Eintrag im /log-Ringpuffer erhalten bleibt,
+// auch wenn WLAN/MQTT/Sensor-Init danach fehlschlagen. So laesst sich am
+// naechsten Morgen nachvollziehen, WARUM das Geraet neu gestartet ist:
+//   - ESP_RST_BROWNOUT  -> Stromversorgungsproblem (Netzteil/Kabel/Spitzen)
+//   - ESP_RST_TASK_WDT / ESP_RST_INT_WDT -> irgendwo blockierender Code
+//     (z.B. haengender UART-Handshake mit dem C1001)
+//   - ESP_RST_PANIC     -> Exception, z.B. durch Heap-Corruption/Fragmentierung
+//   - ESP_RST_POWERON   -> echter Stromausfall/Power-Cycle (nicht Software)
+void logResetReason() {
+  esp_reset_reason_t reason = esp_reset_reason();
+  const char* reasonStr;
+  switch (reason) {
+    case ESP_RST_POWERON:   reasonStr = "Power-On (Stromausfall/-cycle)"; break;
+    case ESP_RST_EXT:       reasonStr = "Externer Reset (Pin/Taster)"; break;
+    case ESP_RST_SW:        reasonStr = "Software-Reset (z.B. ESP.restart())"; break;
+    case ESP_RST_PANIC:     reasonStr = "Exception/Panic (z.B. Heap-Corruption)"; break;
+    case ESP_RST_INT_WDT:   reasonStr = "Interrupt-Watchdog (blockierender Code)"; break;
+    case ESP_RST_TASK_WDT:  reasonStr = "Task-Watchdog (Task haengt zu lange)"; break;
+    case ESP_RST_WDT:       reasonStr = "Sonstiger Watchdog-Reset"; break;
+    case ESP_RST_DEEPSLEEP: reasonStr = "Aufwachen aus Deep Sleep"; break;
+    case ESP_RST_BROWNOUT:  reasonStr = "Brownout (Spannungseinbruch!)"; break;
+    case ESP_RST_SDIO:      reasonStr = "SDIO-Reset"; break;
+    default:                reasonStr = "Unbekannt"; break;
+  }
+  logMsg("[BOOT] Reset-Grund: " + String(reasonStr) + " (Code " + String((int)reason) + ")");
 }
 
 // ==================== WLAN / AP FALLBACK ====================
@@ -308,18 +341,20 @@ void reconnectMQTT() {
 void publishRawData() {
   if (!mqttClient.connected()) return;
 
-  String payload = "{";
-  payload += "\"presence\":"     + String(sensorData.presence)        + ",";
-  payload += "\"movement\":"     + String(sensorData.movement)        + ",";
-  payload += "\"inBed\":"        + String(sensorData.inBed)           + ",";
-  payload += "\"sleepState\":"   + String(sensorData.sleepState)      + ",";
-  payload += "\"breatheState\":" + String(sensorData.breatheState)    + ",";
-  payload += "\"respiration\":"  + String(sensorData.respirationRate) + ",";
-  payload += "\"heartRate\":"    + String(sensorData.heartRate)       + ",";
-  payload += "\"millis\":"       + String(millis());
-  payload += "}";
+  // Bewusst mit char-Puffer + snprintf statt String-Konkatenation: diese
+  // Funktion laeuft die ganze Nacht 1x/Sekunde. String += erzeugt dabei
+  // jedes Mal mehrere temporaere Heap-Allokationen, was über 8h zu
+  // Heap-Fragmentierung und im schlimmsten Fall zum Absturz/Reboot fuehren
+  // kann. snprintf schreibt direkt in einen Stack-Puffer, kein Heap-Churn.
+  char payload[220];
+  snprintf(payload, sizeof(payload),
+    "{\"presence\":%d,\"movement\":%d,\"inBed\":%d,\"sleepState\":%d,"
+    "\"breatheState\":%d,\"respiration\":%.1f,\"heartRate\":%.1f,\"millis\":%lu}",
+    sensorData.presence, sensorData.movement, sensorData.inBed, sensorData.sleepState,
+    sensorData.breatheState, sensorData.respirationRate, sensorData.heartRate,
+    (unsigned long)millis());
 
-  mqttClient.publish(MQTT_TOPIC, payload.c_str());
+  mqttClient.publish(MQTT_TOPIC, payload);
 }
 
 void publishNightStats() {
@@ -542,6 +577,11 @@ bool tryInitSensor() {
 void setup() {
   Serial.begin(115200);
 
+  // Ganz am Anfang loggen, VOR allen anderen Init-Schritten, damit der
+  // Reset-Grund auch dann im Ringpuffer landet, wenn Sensor-Init oder WLAN
+  // danach haengen/fehlschlagen sollten.
+  logResetReason();
+
 #if defined(ESP32)
   Serial1.begin(115200, SERIAL_8N1, /*rx=*/7, /*tx=*/6);
 #else
@@ -584,6 +624,14 @@ void setup() {
 void loop() {
   server.handleClient();
   reconnectWiFi();
+
+  // Heap-Trend alle 5 Min. loggen. Faellt der Wert ueber die Nacht stetig,
+  // ist Heap-Fragmentierung durch String-Konkatenation die Ursache fuer die
+  // Reboots - getMinFreeHeap() zeigt den bisherigen Tiefpunkt seit Boot.
+  if (millis() - lastHeapLog > HEAP_LOG_INTERVAL_MS) {
+    lastHeapLog = millis();
+    logMsg("[HEAP] frei=" + String(ESP.getFreeHeap()) + " min=" + String(ESP.getMinFreeHeap()));
+  }
 
   if (!apMode) {
     if (!mqttClient.connected()) reconnectMQTT();
