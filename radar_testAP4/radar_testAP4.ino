@@ -55,7 +55,7 @@ const char* NTP_SERVER_2 = "pool.ntp.org";
 const char* TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3";
 
 // --- Ringpuffer für /log ---
-const uint8_t LOG_BUFFER_SIZE = 500;
+const uint16_t LOG_BUFFER_SIZE = 500;
 
 // --- Web-Stylesheet ---
 // Hinweis: "SS" ist auf dem ESP32-C6 SuperMini bereits als SPI-Pin (uint8_t)
@@ -830,12 +830,12 @@ void handleJSON() {
 void handleLog() {
   String out = "";
   if (logFull) {
-    for (uint8_t i = 0; i < LOG_BUFFER_SIZE; i++) {
-      uint8_t idx = (logIndex + i) % LOG_BUFFER_SIZE;
+    for (uint16_t i = 0; i < LOG_BUFFER_SIZE; i++) {
+      uint16_t idx = (logIndex + i) % LOG_BUFFER_SIZE;
       out += logBuffer[idx] + "\n";
     }
   } else {
-    for (uint8_t i = 0; i < logIndex; i++) {
+    for (uint16_t i = 0; i < logIndex; i++) {
       out += logBuffer[i] + "\n";
     }
   }
