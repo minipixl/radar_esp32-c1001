@@ -57,6 +57,12 @@ const char* TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3";
 // --- Ringpuffer für /log ---
 const uint16_t LOG_BUFFER_SIZE = 500;
 
+// für Pulsmittelwert
+double   hrSum = 0;  uint32_t hrCount = 0;
+double   brSum = 0;  uint32_t brCount = 0;
+
+void resetVitalAccumulators() { hrSum = 0; hrCount = 0; brSum = 0; brCount = 0; }
+
 // --- Web-Stylesheet ---
 // Hinweis: "SS" ist auf dem ESP32-C6 SuperMini bereits als SPI-Pin (uint8_t)
 // in pins_arduino.h vordefiniert -> anderer Name nötig.
@@ -485,8 +491,10 @@ void finalizeSession() {
   nightStats.lightSleepPercentage= stats.shallowSleepPercentage;
   nightStats.deepSleepPercentage = stats.deepSleepPercentage;
   nightStats.sleepScore          = stats.sleepQualityScore;
-  nightStats.avgRespiration      = stats.averageRespiration;
-  nightStats.avgHeartRate        = stats.averageHeartbeat;
+  // nightStats.avgRespiration      = stats.averageRespiration;
+  // nightStats.avgHeartRate        = stats.averageHeartbeat;
+  nightStats.avgHeartRate   = hrCount ? (float)(hrSum / hrCount) : stats.averageHeartbeat; // korrektur
+  nightStats.avgRespiration = brCount ? (float)(brSum / brCount) : stats.averageRespiration; // korrektur
   nightStats.turnCount           = stats.turnOverCount;
   nightStats.apneaEvents         = stats.apneaEvents;
   nightStats.largeBodyMove       = comp.largeBodyMove;
@@ -661,6 +669,15 @@ void loop() {
   sensorData.sleepState      = comp.sleepState;
   sensorData.lastUpdate      = millis();
 
+// Korrketur Pulsmittelwert
+  if (sessionState != OUT_OF_BED && sensorData.inBed == 1) {
+    if (sensorData.heartRate >= 30 && sensorData.heartRate <= 200) {
+      hrSum += sensorData.heartRate; hrCount++;
+    }
+    if (sensorData.respirationRate >= 4 && sensorData.respirationRate <= 40) {
+      brSum += sensorData.respirationRate; brCount++;
+    }
+  }
   // --- Session-State-Machine (Abschnitt 4) ---
   runSessionStateMachine();
 
